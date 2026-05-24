@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
 import { useSocket } from '../context/SocketContext';
+import { encryptMessage, decryptMessage } from '../utils/crypto';
 
 function getInitial(name) {
   return name ? name[0].toUpperCase() : '?';
@@ -23,7 +24,7 @@ function formatDateLabel(dateStr) {
 }
 
 export default function Chat() {
-  const { user, logout } = useAuth();
+  const { user, logout, privateKey, publicKey } = useAuth();
   const { socket, onlineUsers } = useSocket();
 
   const [users, setUsers] = useState([]);
@@ -36,7 +37,8 @@ export default function Chat() {
   const [newMessageCount, setNewMessageCount] = useState(0);
   const [unreadCounts, setUnreadCounts] = useState({});
   const [typingUsers, setTypingUsers] = useState({});
-  const [activeNav, setActiveNav] = useState('messages'); // 'home', 'messages', 'settings'
+  const [activeNav, setActiveNav] = useState('messages');
+  const [decryptedMessages, setDecryptedMessages] = useState({}); // Cache decrypted messages
 
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
@@ -47,53 +49,99 @@ export default function Chat() {
     axios.get('/api/users').then(({ data }) => setUsers(data));
   }, []);
 
-  // Load conversation
+  // Load conversation and decrypt messages
   useEffect(() => {
-    if (!selectedUser) return;
-    axios.get(`/api/messages/${selectedUser._id}`).then(({ data }) => {
-      setMessages(data.messages);
-      // Mark messages as seen when they become visible
-      // Use Intersection Observer to detect when messages scroll into view
-      setTimeout(() => {
-        markUnseenMessagesAsSeen(data.messages, data.conversation);
-      }, 500);
-    });
-  }, [selectedUser, socket, user._id]);
+    if (!selectedUser || !privateKey) return;
+
+    (async () => {
+      try {
+        const { data } = await axios.get(`/api/messages/${selectedUser._id}`);
+        setMessages(data.messages);
+
+        // Decrypt all messages
+        const decrypted = {};
+        for (const msg of data.messages) {
+          if (msg.cipherText && msg.nonce && msg.sender._id && privateKey) {
+            try {
+              // Get sender's public key from users list
+              const sender = users.find((u) => u._id === msg.sender._id);
+              if (sender?.publicKey) {
+                const decryptedText = await decryptMessage(msg.cipherText, msg.nonce, sender.publicKey, privateKey);
+                decrypted[msg._id] = decryptedText;
+              }
+            } catch (err) {
+              console.error(`Failed to decrypt message ${msg._id}:`, err);
+            }
+          }
+        }
+        setDecryptedMessages(decrypted);
+
+        // Mark messages as seen when they become visible
+        setTimeout(() => {
+          markUnseenMessagesAsSeen(data.messages, data.conversation);
+        }, 500);
+      } catch (err) {
+        console.error('Failed to load conversation:', err);
+      }
+    })();
+  }, [selectedUser, privateKey, users]);
 
   // Socket: receive messages
   useEffect(() => {
-    if (!socket) return;
+    if (!socket || !privateKey || !users.length) return;
 
-    const handleNewMessage = (msg) => {
-      if (
-        selectedUser &&
-        (msg.sender._id === selectedUser._id || msg.sender._id === user._id ||
-          msg.recipients.includes(selectedUser._id) || msg.recipients.includes(user._id))
-      ) {
-        setMessages((prev) => {
-          // avoid duplicates
-          if (prev.find((m) => m._id === msg._id)) return prev;
-          return [...prev, msg];
-        });
-        // Increment new message counter if not at bottom
-        if (!shouldAutoScroll) {
-          setNewMessageCount((prev) => prev + 1);
+    const handleNewMessage = async (msg) => {
+      try {
+        // Decrypt message if encrypted
+        let decryptedText = '';
+        if (msg.cipherText && msg.nonce && msg.sender._id && privateKey) {
+          // Get sender's public key
+          const senderPublicKey = users.find((u) => u._id === msg.sender._id)?.publicKey;
+          if (senderPublicKey) {
+            decryptedText = await decryptMessage(msg.cipherText, msg.nonce, senderPublicKey, privateKey);
+          }
         }
-        // Mark message as seen if from other user
-        if (msg.sender._id === selectedUser._id && msg.status !== 'read') {
-          setTimeout(() => {
-            // Mark locally
-            markMessageAsSeenLocally(msg._id);
-            // Notify sender
-            socket?.emit('markMessageSeen', { messageId: msg._id, conversationId: msg.conversation });
-          }, 500);
+
+        if (
+          selectedUser &&
+          (msg.sender._id === selectedUser._id || msg.sender._id === user._id ||
+            msg.recipients.includes(selectedUser._id) || msg.recipients.includes(user._id))
+        ) {
+          // Store decrypted message
+          if (decryptedText) {
+            setDecryptedMessages((prev) => ({
+              ...prev,
+              [msg._id]: decryptedText,
+            }));
+          }
+
+          setMessages((prev) => {
+            // avoid duplicates
+            if (prev.find((m) => m._id === msg._id)) return prev;
+            return [...prev, msg];
+          });
+          // Increment new message counter if not at bottom
+          if (!shouldAutoScroll) {
+            setNewMessageCount((prev) => prev + 1);
+          }
+          // Mark message as seen if from other user
+          if (msg.sender._id === selectedUser._id && msg.status !== 'read') {
+            setTimeout(() => {
+              // Mark locally
+              markMessageAsSeenLocally(msg._id);
+              // Notify sender
+              socket?.emit('markMessageSeen', { messageId: msg._id, conversationId: msg.conversation });
+            }, 500);
+          }
+        } else if (msg.sender._id !== user._id) {
+          // If message is from a different user and not in current conversation, increment unread
+          setUnreadCounts((prev) => ({
+            ...prev,
+            [msg.sender._id]: (prev[msg.sender._id] || 0) + 1,
+          }));
         }
-      } else if (msg.sender._id !== user._id) {
-        // If message is from a different user and not in current conversation, increment unread
-        setUnreadCounts((prev) => ({
-          ...prev,
-          [msg.sender._id]: (prev[msg.sender._id] || 0) + 1,
-        }));
+      } catch (err) {
+        console.error('Failed to decrypt message:', err);
       }
     };
 
@@ -192,6 +240,19 @@ export default function Chat() {
     }));
   };
 
+  // Helper function to get decrypted or plaintext message
+  const getMessageText = (msg) => {
+    // If we have a decrypted message, use it
+    if (decryptedMessages[msg._id]) {
+      return decryptedMessages[msg._id];
+    }
+    // Fallback to plaintext (legacy messages or if decryption fails)
+    if (msg.content?.text) {
+      return msg.content.text;
+    }
+    return msg.content || '[Encrypted message]';
+  };
+
   // Helper function to mark a message as seen
   const markMessageAsSeenLocally = (messageId) => {
     setMessages((prev) =>
@@ -219,11 +280,33 @@ export default function Chat() {
     });
   };
 
-  const handleSend = () => {
-    if (!text.trim() || !selectedUser || !socket) return;
-    socket.emit('sendMessage', { to: selectedUser._id, content: text.trim() });
-    setText('');
-    socket.emit('stopTyping', { to: selectedUser._id });
+  const handleSend = async () => {
+    if (!text.trim() || !selectedUser || !socket || !privateKey) {
+      alert('Cannot send message. Please check your encryption keys.');
+      return;
+    }
+
+    try {
+      // Fetch recipient's public key
+      const { data: keyData } = await axios.get(`/api/users/${selectedUser._id}/public-key`);
+      const recipientPublicKey = keyData.publicKey;
+
+      // Encrypt message
+      const { cipherText, nonce } = await encryptMessage(text.trim(), recipientPublicKey, privateKey);
+
+      // Send encrypted message to backend
+      socket.emit('sendMessage', {
+        to: selectedUser._id,
+        cipherText,
+        nonce,
+      });
+
+      setText('');
+      socket.emit('stopTyping', { to: selectedUser._id });
+    } catch (err) {
+      console.error('Failed to send encrypted message:', err);
+      alert('Failed to send message: ' + err.message);
+    }
   };
 
   const handleKeyDown = (e) => {
@@ -438,7 +521,7 @@ export default function Chat() {
                     className={`message-wrapper ${item.msg.sender._id === user._id ? 'out' : 'in'}`}
                   >
                     <div className="message-bubble">
-                      <div className="message-content">{item.msg.content?.text || item.msg.content}</div>
+                      <div className="message-content">{getMessageText(item.msg)}</div>
                       <div className="message-footer">
                         <span className="message-time">{formatTime(item.msg.createdAt)}</span>
                         {item.msg.sender._id === user._id && (

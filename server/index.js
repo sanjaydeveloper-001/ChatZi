@@ -1,17 +1,17 @@
-require('dotenv').config();
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const mongoose = require('mongoose');
-const cors = require('cors');
-const jwt = require('jsonwebtoken');
+import 'dotenv/config.js';
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import jwt from 'jsonwebtoken';
 
-const authRoutes = require('./routes/auth');
-const userRoutes = require('./routes/users');
-const messageRoutes = require('./routes/messages');
-const Message = require('./models/Message');
-const User = require('./models/User');
-const Conversation = require('./models/Conversation');
+import authRoutes from './routes/auth.js';
+import userRoutes from './routes/users.js';
+import messageRoutes from './routes/messages.js';
+import Message from './models/Message.js';
+import User from './models/User.js';
+import Conversation from './models/Conversation.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -63,7 +63,7 @@ io.on('connection', async (socket) => {
   socket.join(socket.userId);
 
   // Handle sending a message
-  socket.on('sendMessage', async ({ to, conversationId, content }) => {
+  socket.on('sendMessage', async ({ to, conversationId, cipherText, nonce }) => {
     try {
       const sender = await User.findById(socket.userId);
       const recipient = await User.findById(to);
@@ -71,6 +71,12 @@ io.on('connection', async (socket) => {
       // Check if blocked
       if (sender.blockedUsers.includes(to) || recipient.blockedUsers.includes(socket.userId)) {
         socket.emit('messageError', 'Cannot send message to this user');
+        return;
+      }
+
+      // Validate encrypted message
+      if (!cipherText || !nonce) {
+        socket.emit('messageError', 'Invalid encrypted message');
         return;
       }
 
@@ -87,11 +93,15 @@ io.on('connection', async (socket) => {
         });
       }
 
+      // Store ONLY encrypted data
       const messageData = {
         conversation: conversation._id,
         sender: socket.userId,
         recipients: [to],
-        content: typeof content === 'string' ? { text: content } : content,
+        cipherText, // Encrypted message
+        nonce, // Encryption nonce
+        // Don't store plaintext
+        content: { text: '', images: [], files: [] },
         status: 'sent',
       };
 
@@ -101,20 +111,20 @@ io.on('connection', async (socket) => {
       // Update conversation
       conversation.lastMessage = message._id;
       conversation.lastMessageAt = new Date();
-      
+
       // Increment unread count for recipient
       const currentCount = conversation.unreadCount.get(to.toString()) || 0;
       conversation.unreadCount.set(to.toString(), currentCount + 1);
       await conversation.save();
 
-      // Send to recipient
+      // Send encrypted message to recipient
       io.to(to).emit('newMessage', populated);
       // Echo back to sender
       io.to(socket.userId).emit('newMessage', populated);
-      // Notify recipient about new unread message in sidebar
+      // Notify recipient about new unread message in sidebar (don't decrypt here, just notify)
       io.to(to).emit('conversationUpdate', {
         conversationId: conversation._id,
-        lastMessage: populated.content.text,
+        lastMessage: '[Encrypted message]', // Don't expose plaintext
         lastMessageAt: conversation.lastMessageAt,
         unreadCount: currentCount + 1,
       });

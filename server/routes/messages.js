@@ -1,8 +1,10 @@
-const router = require('express').Router();
-const auth = require('../middleware/auth');
-const Message = require('../models/Message');
-const Conversation = require('../models/Conversation');
-const User = require('../models/User');
+import { Router } from 'express';
+import auth from '../middleware/auth.js';
+import Message from '../models/Message.js';
+import Conversation from '../models/Conversation.js';
+import User from '../models/User.js';
+
+const router = Router();
 
 // GET /api/messages/:userId - Get or create conversation
 router.get('/:userId', auth, async (req, res) => {
@@ -140,4 +142,4 @@ router.delete('/:messageId', auth, async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;

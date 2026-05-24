@@ -1,5 +1,5 @@
-const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
+import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
 
 const userSchema = new mongoose.Schema(
   {
@@ -14,6 +14,11 @@ const userSchema = new mongoose.Schema(
     isOnline: { type: Boolean, default: false },
     lastSeen: { type: Date, default: Date.now },
     blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    // E2EE encryption keys
+    publicKey: { type: String, default: null }, // Public key (hex string)
+    encryptedPrivateKey: { type: String, default: null }, // Encrypted private key (hex string)
+    privateKeyNonce: { type: String, default: null }, // Nonce for private key encryption (hex string)
+    privateKeySalt: { type: String, default: null }, // Salt for password derivation (hex string)
     notifications: [
       {
         type: { type: String, enum: ['message', 'typing', 'blocked'], default: 'message' },
@@ -42,4 +47,4 @@ userSchema.methods.comparePassword = function (password) {
   return bcrypt.compare(password, this.password);
 };
 
-module.exports = mongoose.model('User', userSchema);
+export default mongoose.model('User', userSchema);

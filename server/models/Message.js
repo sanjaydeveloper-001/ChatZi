@@ -1,10 +1,14 @@
-const mongoose = require('mongoose');
+import mongoose from 'mongoose';
 
 const messageSchema = new mongoose.Schema(
   {
     conversation: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true },
     sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     recipients: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    // E2EE encrypted message content
+    cipherText: { type: String, default: '' }, // Encrypted message (hex string)
+    nonce: { type: String, default: '' }, // Nonce for encryption (hex string)
+    // Legacy fields (can be removed in future)
     content: {
       text: { type: String, default: '' },
       images: [String],
@@ -31,4 +35,4 @@ const messageSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-module.exports = mongoose.model('Message', messageSchema);
+export default mongoose.model('Message', messageSchema);

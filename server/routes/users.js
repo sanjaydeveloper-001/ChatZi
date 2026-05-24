@@ -1,7 +1,9 @@
-const router = require('express').Router();
-const auth = require('../middleware/auth');
-const User = require('../models/User');
-const Conversation = require('../models/Conversation');
+import { Router } from 'express';
+import auth from '../middleware/auth.js';
+import User from '../models/User.js';
+import Conversation from '../models/Conversation.js';
+
+const router = Router();
 
 // GET /api/users — all users except self with conversation info
 router.get('/', auth, async (req, res) => {
@@ -30,6 +32,19 @@ router.get('/', auth, async (req, res) => {
     );
 
     res.json(usersWithConversations);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET /api/users/:userId/public-key — get user's public key for E2EE
+router.get('/:userId/public-key', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId).select('_id username publicKey');
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!user.publicKey) return res.status(400).json({ message: 'User public key not found' });
+
+    res.json({ _id: user._id, username: user.username, publicKey: user.publicKey });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -85,4 +100,4 @@ router.get('/blocked', auth, async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;
