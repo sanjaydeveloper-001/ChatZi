@@ -1,170 +1,215 @@
-import sodium from 'libsodium-wrappers-sumo';
+/**
+ * src/utils/crypto.js  (CLIENT — React + Vite + ESModules)
+ *
+ * SIMPLIFIED private key encryption using crypto_generichash instead of Argon2.
+ *
+ * ─── WHAT CHANGED ────────────────────────────────────────────────────────────
+ *
+ * REMOVED:
+ *   - crypto_pwhash / Argon2 — was crashing in browser/Vite
+ *   - deriveKeyFromPassword(password, saltHex) — gone
+ *   - saltHex parameter from decryptPrivateKey — no longer needed
+ *   - All Buffer usage — Buffer does not exist in the browser
+ *
+ * NEW FLOW:
+ *   encryptPrivateKey:  key = crypto_generichash(32, from_string(password))
+ *   decryptPrivateKey:  key = crypto_generichash(32, from_string(password))
+ *
+ * KEPT:
+ *   - crypto_box_easy / open_easy for messages (true E2EE unchanged)
+ *   - All sodium helpers: from_hex, to_hex, from_string, to_string
+ *   - Explicit byte lengths on all randombytes_buf calls
+ *
+ * ─── INSTALL ─────────────────────────────────────────────────────────────────
+ *   npm install libsodium-wrappers@0.7.13
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 
-const sodiumReady = (async () => {
-  await sodium.ready;
-})();
+import sodium from 'libsodium-wrappers';
 
+// ─── Singleton initialization ─────────────────────────────────────────────────
+// sodium.ready is already a Promise — no IIFE wrapper needed
+const sodiumReady = sodium.ready;
+
+/**
+ * Ensure sodium WASM is initialized. Returns the sodium module.
+ * @returns {Promise<typeof sodium>}
+ */
 export async function ensureSodium() {
   await sodiumReady;
   return sodium;
 }
 
-/**
- * Derive encryption key from password using argon2i
- * @param {string} password - User password
- * @param {string} saltHex - Salt in hex format
- * @returns {Uint8Array} Derived key
- */
-export async function deriveKeyFromPassword(password, saltHex) {
-  await ensureSodium();
+// ─── Internal helper ──────────────────────────────────────────────────────────
 
-  if (!password || typeof password !== 'string') {
+/**
+ * Hash a password into a 32-byte key using BLAKE2b (crypto_generichash).
+ * Deterministic: same password → same key, every time.
+ * No salt, no Argon2, no randombytes — stable in all environments.
+ *
+ * @param {string} password
+ * @returns {Promise<Uint8Array>} 32-byte key
+ */
+async function hashPasswordToKey(password) {
+  const na = await ensureSodium();
+
+  if (!password || typeof password !== 'string' || password.length === 0) {
     throw new Error('Password must be a non-empty string');
   }
 
-  if (!saltHex || typeof saltHex !== 'string') {
-    throw new Error('Salt must be a hex string');
-  }
+  // from_string() → Uint8Array (NO Buffer — Buffer not available in browser)
+  const key = na.crypto_generichash(32, na.from_string(password));
 
-  const salt = sodium.from_hex(saltHex);
-  const key = sodium.crypto_pwhash(
-    sodium.crypto_secretbox_KEYBYTES,
-    password,
-    salt,
-    sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE,
-    sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
-    sodium.crypto_pwhash_ALG_DEFAULT
-  );
-
-  if (!key || key.length === 0) {
-    throw new Error('Failed to derive key from password');
+  if (!key || key.length !== 32) {
+    throw new Error('Password hashing produced an invalid key');
   }
 
   return key;
 }
 
+// ─── Private key encryption / decryption ─────────────────────────────────────
+
 /**
- * Decrypt private key using password
- * @param {string} encryptedPrivateKeyHex - Encrypted private key (hex)
- * @param {string} nonceHex - Nonce (hex)
- * @param {string} saltHex - Salt (hex)
- * @param {string} password - User password
- * @returns {string} Decrypted private key in hex format
+ * Encrypt a private key with the user's password.
+ * Called on the SERVER during signup — exported here for symmetry/testing.
+ *
+ * @param {string} privateKeyHex - Private key as hex string
+ * @param {string} password      - User's plaintext password
+ * @returns {Promise<{ encryptedPrivateKey: string, nonce: string }>}
  */
-export async function decryptPrivateKey(encryptedPrivateKeyHex, nonceHex, saltHex, password) {
-  await ensureSodium();
+export async function encryptPrivateKey(privateKeyHex, password) {
+  const na = await ensureSodium();
 
-  if (!encryptedPrivateKeyHex || typeof encryptedPrivateKeyHex !== 'string') {
-    throw new Error('Encrypted private key must be a hex string');
+  if (!privateKeyHex || typeof privateKeyHex !== 'string') {
+    throw new Error('Private key must be a hex string');
   }
-
-  if (!nonceHex || typeof nonceHex !== 'string') {
-    throw new Error('Nonce must be a hex string');
-  }
-
-  if (!saltHex || typeof saltHex !== 'string') {
-    throw new Error('Salt must be a hex string');
-  }
-
   if (!password || typeof password !== 'string') {
     throw new Error('Password must be a non-empty string');
   }
 
-  const encryptedPrivateKey = sodium.from_hex(encryptedPrivateKeyHex);
-  const nonce = sodium.from_hex(nonceHex);
+  const key             = await hashPasswordToKey(password);
+  const nonce           = na.randombytes_buf(na.crypto_secretbox_NONCEBYTES); // 24 bytes
+  const privateKeyBytes = na.from_hex(privateKeyHex);  // Uint8Array — NOT Buffer
 
-  const key = await deriveKeyFromPassword(password, saltHex);
-
-  const privateKey = sodium.crypto_secretbox_open_easy(encryptedPrivateKey, nonce, key);
-
-  if (!privateKey || privateKey.length === 0) {
-    throw new Error('Failed to decrypt private key. Check your password.');
-  }
-
-  return sodium.to_hex(privateKey);
-}
-
-/**
- * Encrypt message for recipient
- * @param {string} message - Plain text message
- * @param {string} recipientPublicKeyHex - Recipient's public key (hex)
- * @param {string} senderPrivateKeyHex - Sender's private key (hex)
- * @returns {Object} { cipherText, nonce } - Both in hex format
- */
-export async function encryptMessage(message, recipientPublicKeyHex, senderPrivateKeyHex) {
-  await ensureSodium();
-
-  if (!message || typeof message !== 'string') {
-    throw new Error('Message must be a non-empty string');
-  }
-
-  if (!recipientPublicKeyHex || typeof recipientPublicKeyHex !== 'string') {
-    throw new Error('Recipient public key must be a hex string');
-  }
-
-  if (!senderPrivateKeyHex || typeof senderPrivateKeyHex !== 'string') {
-    throw new Error('Sender private key must be a hex string');
-  }
-
-  const recipientPublicKey = sodium.from_hex(recipientPublicKeyHex);
-  const senderPrivateKey = sodium.from_hex(senderPrivateKeyHex);
-  const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES);
-
-  if (!nonce || nonce.length === 0) {
-    throw new Error('Failed to generate nonce');
-  }
-
-  const messageBuffer = sodium.from_string(message);
-
-  const cipherText = sodium.crypto_box_easy(messageBuffer, nonce, recipientPublicKey, senderPrivateKey);
-
-  if (!cipherText || cipherText.length === 0) {
-    throw new Error('Failed to encrypt message');
-  }
+  const encryptedBytes = na.crypto_secretbox_easy(privateKeyBytes, nonce, key);
 
   return {
-    cipherText: sodium.to_hex(cipherText),
-    nonce: sodium.to_hex(nonce),
+    encryptedPrivateKey: na.to_hex(encryptedBytes),
+    nonce:               na.to_hex(nonce),
   };
 }
 
 /**
- * Decrypt message from sender
- * @param {string} cipherTextHex - Encrypted message (hex)
- * @param {string} nonceHex - Nonce (hex)
- * @param {string} senderPublicKeyHex - Sender's public key (hex)
- * @param {string} recipientPrivateKeyHex - Recipient's private key (hex)
- * @returns {string} Decrypted message
+ * Decrypt the user's private key after login.
+ * NOTE: No saltHex parameter — salt was removed from this simplified flow.
+ *
+ * @param {string} encryptedPrivateKeyHex - From server login response (hex)
+ * @param {string} nonceHex              - From server login response (hex)
+ * @param {string} password              - User's plaintext password
+ * @returns {Promise<string>} Decrypted private key as hex string (store in memory only)
+ */
+export async function decryptPrivateKey(encryptedPrivateKeyHex, nonceHex, password) {
+  const na = await ensureSodium();
+
+  if (!encryptedPrivateKeyHex || typeof encryptedPrivateKeyHex !== 'string') {
+    throw new Error('Encrypted private key must be a hex string');
+  }
+  if (!nonceHex || typeof nonceHex !== 'string') {
+    throw new Error('Nonce must be a hex string');
+  }
+  if (!password || typeof password !== 'string') {
+    throw new Error('Password must be a non-empty string');
+  }
+
+  const key            = await hashPasswordToKey(password);
+  const encryptedBytes = na.from_hex(encryptedPrivateKeyHex);
+  const nonce          = na.from_hex(nonceHex);
+
+  const privateKey = na.crypto_secretbox_open_easy(encryptedBytes, nonce, key);
+
+  if (!privateKey || privateKey.length === 0) {
+    throw new Error('Decryption failed — wrong password or corrupted data');
+  }
+
+  // Return as hex string for storage in React state (memory only, never localStorage)
+  return na.to_hex(privateKey);
+}
+
+// ─── Message encryption / decryption ─────────────────────────────────────────
+
+/**
+ * Encrypt a UTF-8 message. True E2EE — server never sees plaintext.
+ *
+ * @param {string} message               - Plaintext message
+ * @param {string} recipientPublicKeyHex - Recipient public key (hex)
+ * @param {string} senderPrivateKeyHex   - Sender private key (hex, from memory)
+ * @returns {Promise<{ cipherText: string, nonce: string }>}
+ */
+export async function encryptMessage(message, recipientPublicKeyHex, senderPrivateKeyHex) {
+  const na = await ensureSodium();
+
+  if (!message || typeof message !== 'string') {
+    throw new Error('Message must be a non-empty string');
+  }
+  if (!recipientPublicKeyHex || typeof recipientPublicKeyHex !== 'string') {
+    throw new Error('Recipient public key must be a hex string');
+  }
+  if (!senderPrivateKeyHex || typeof senderPrivateKeyHex !== 'string') {
+    throw new Error('Sender private key must be a hex string');
+  }
+
+  const recipientPublicKey = na.from_hex(recipientPublicKeyHex);
+  const senderPrivateKey   = na.from_hex(senderPrivateKeyHex);
+  const nonce              = na.randombytes_buf(na.crypto_box_NONCEBYTES); // 24 bytes
+  const messageBytes       = na.from_string(message); // Uint8Array — NOT Buffer
+
+  const cipherText = na.crypto_box_easy(messageBytes, nonce, recipientPublicKey, senderPrivateKey);
+
+  if (!cipherText || cipherText.length === 0) {
+    throw new Error('Message encryption failed');
+  }
+
+  return {
+    cipherText: na.to_hex(cipherText),
+    nonce:      na.to_hex(nonce),
+  };
+}
+
+/**
+ * Decrypt a message. Returns plaintext only in the browser — never sent to server.
+ *
+ * @param {string} cipherTextHex          - Encrypted message (hex)
+ * @param {string} nonceHex               - Nonce (hex)
+ * @param {string} senderPublicKeyHex     - Sender public key (hex)
+ * @param {string} recipientPrivateKeyHex - Recipient private key (hex, from memory)
+ * @returns {Promise<string>} Decrypted UTF-8 message
  */
 export async function decryptMessage(cipherTextHex, nonceHex, senderPublicKeyHex, recipientPrivateKeyHex) {
-  await ensureSodium();
+  const na = await ensureSodium();
 
   if (!cipherTextHex || typeof cipherTextHex !== 'string') {
     throw new Error('Cipher text must be a hex string');
   }
-
   if (!nonceHex || typeof nonceHex !== 'string') {
     throw new Error('Nonce must be a hex string');
   }
-
   if (!senderPublicKeyHex || typeof senderPublicKeyHex !== 'string') {
     throw new Error('Sender public key must be a hex string');
   }
-
   if (!recipientPrivateKeyHex || typeof recipientPrivateKeyHex !== 'string') {
     throw new Error('Recipient private key must be a hex string');
   }
 
-  const cipherText = sodium.from_hex(cipherTextHex);
-  const nonce = sodium.from_hex(nonceHex);
-  const senderPublicKey = sodium.from_hex(senderPublicKeyHex);
-  const recipientPrivateKey = sodium.from_hex(recipientPrivateKeyHex);
+  const cipherText          = na.from_hex(cipherTextHex);
+  const nonce               = na.from_hex(nonceHex);
+  const senderPublicKey     = na.from_hex(senderPublicKeyHex);
+  const recipientPrivateKey = na.from_hex(recipientPrivateKeyHex);
 
-  const decrypted = sodium.crypto_box_open_easy(cipherText, nonce, senderPublicKey, recipientPrivateKey);
+  const decrypted = na.crypto_box_open_easy(cipherText, nonce, senderPublicKey, recipientPrivateKey);
 
   if (!decrypted || decrypted.length === 0) {
-    throw new Error('Failed to decrypt message');
+    throw new Error('Message decryption failed — wrong keys or corrupted data');
   }
 
-  return sodium.to_string(decrypted);
+  return na.to_string(decrypted); // to_string() works in browser; Buffer does NOT
 }

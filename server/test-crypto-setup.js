@@ -6,7 +6,7 @@
  * Command: node test-crypto-setup.js
  */
 
-import sodium from 'libsodium-wrappers-sumo';
+import sodium from 'libsodium-wrappers';
 
 console.log('\n' + '='.repeat(60));
 console.log('SODIUM INITIALIZATION TEST');

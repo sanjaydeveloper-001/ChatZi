@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
 import { useSocket } from '../context/SocketContext';
@@ -24,7 +24,7 @@ function formatDateLabel(dateStr) {
 }
 
 export default function Chat() {
-  const { user, logout, privateKey, publicKey } = useAuth();
+  const { user, logout, privateKey } = useAuth();
   const { socket, onlineUsers } = useSocket();
 
   const [users, setUsers] = useState([]);
@@ -38,7 +38,7 @@ export default function Chat() {
   const [unreadCounts, setUnreadCounts] = useState({});
   const [typingUsers, setTypingUsers] = useState({});
   const [activeNav, setActiveNav] = useState('messages');
-  const [decryptedMessages, setDecryptedMessages] = useState({}); // Cache decrypted messages
+  const [decryptedMessages, setDecryptedMessages] = useState({});
 
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
@@ -58,25 +58,34 @@ export default function Chat() {
         const { data } = await axios.get(`/api/messages/${selectedUser._id}`);
         setMessages(data.messages);
 
-        // Decrypt all messages
         const decrypted = {};
         for (const msg of data.messages) {
-          if (msg.cipherText && msg.nonce && msg.sender._id && privateKey) {
+          if (msg.cipherText && msg.nonce) {
             try {
-              // Get sender's public key from users list
-              const sender = users.find((u) => u._id === msg.sender._id);
-              if (sender?.publicKey) {
-                const decryptedText = await decryptMessage(msg.cipherText, msg.nonce, sender.publicKey, privateKey);
+              // For messages sent by current user, use selectedUser's public key as sender
+              // For messages received, use the sender's public key
+              const senderIsMe = msg.sender._id === user._id;
+              const senderPublicKey = senderIsMe
+                ? selectedUser.publicKey
+                : users.find((u) => u._id === msg.sender._id)?.publicKey;
+
+              if (senderPublicKey) {
+                const decryptedText = await decryptMessage(
+                  msg.cipherText,
+                  msg.nonce,
+                  senderPublicKey,
+                  privateKey
+                );
                 decrypted[msg._id] = decryptedText;
               }
             } catch (err) {
               console.error(`Failed to decrypt message ${msg._id}:`, err);
+              decrypted[msg._id] = null; // mark as failed — don't leave undefined
             }
           }
         }
         setDecryptedMessages(decrypted);
 
-        // Mark messages as seen when they become visible
         setTimeout(() => {
           markUnseenMessagesAsSeen(data.messages, data.conversation);
         }, 500);
@@ -92,93 +101,89 @@ export default function Chat() {
 
     const handleNewMessage = async (msg) => {
       try {
-        // Decrypt message if encrypted
-        let decryptedText = '';
-        if (msg.cipherText && msg.nonce && msg.sender._id && privateKey) {
-          // Get sender's public key
-          const senderPublicKey = users.find((u) => u._id === msg.sender._id)?.publicKey;
+        let decryptedText = null;
+
+        if (msg.cipherText && msg.nonce) {
+          const senderIsMe = msg.sender._id === user._id;
+          const senderPublicKey = senderIsMe
+            ? selectedUser?.publicKey
+            : users.find((u) => u._id === msg.sender._id)?.publicKey;
+
           if (senderPublicKey) {
-            decryptedText = await decryptMessage(msg.cipherText, msg.nonce, senderPublicKey, privateKey);
+            try {
+              decryptedText = await decryptMessage(
+                msg.cipherText,
+                msg.nonce,
+                senderPublicKey,
+                privateKey
+              );
+            } catch (err) {
+              console.error('Decryption failed for incoming message:', err);
+            }
           }
         }
 
-        if (
+        const isInCurrentConversation =
           selectedUser &&
-          (msg.sender._id === selectedUser._id || msg.sender._id === user._id ||
-            msg.recipients.includes(selectedUser._id) || msg.recipients.includes(user._id))
-        ) {
-          // Store decrypted message
-          if (decryptedText) {
-            setDecryptedMessages((prev) => ({
-              ...prev,
-              [msg._id]: decryptedText,
-            }));
-          }
+          (msg.sender._id === selectedUser._id ||
+            msg.sender._id === user._id ||
+            msg.recipients?.includes(selectedUser._id) ||
+            msg.recipients?.includes(user._id));
+
+        if (isInCurrentConversation) {
+          setDecryptedMessages((prev) => ({
+            ...prev,
+            [msg._id]: decryptedText, // null if failed, string if success
+          }));
 
           setMessages((prev) => {
-            // avoid duplicates
             if (prev.find((m) => m._id === msg._id)) return prev;
             return [...prev, msg];
           });
-          // Increment new message counter if not at bottom
+
           if (!shouldAutoScroll) {
             setNewMessageCount((prev) => prev + 1);
           }
-          // Mark message as seen if from other user
+
           if (msg.sender._id === selectedUser._id && msg.status !== 'read') {
             setTimeout(() => {
-              // Mark locally
               markMessageAsSeenLocally(msg._id);
-              // Notify sender
-              socket?.emit('markMessageSeen', { messageId: msg._id, conversationId: msg.conversation });
+              socket?.emit('markMessageSeen', {
+                messageId: msg._id,
+                conversationId: msg.conversation,
+              });
             }, 500);
           }
         } else if (msg.sender._id !== user._id) {
-          // If message is from a different user and not in current conversation, increment unread
           setUnreadCounts((prev) => ({
             ...prev,
             [msg.sender._id]: (prev[msg.sender._id] || 0) + 1,
           }));
         }
       } catch (err) {
-        console.error('Failed to decrypt message:', err);
+        console.error('handleNewMessage error:', err);
       }
     };
 
     const handleTyping = ({ from, username }) => {
-      // Update global typing status for sidebar
-      setTypingUsers((prev) => ({
-        ...prev,
-        [from]: username,
-      }));
-      // Also update current conversation typing if applicable
-      if (selectedUser && from === selectedUser._id) {
-        setTypingInfo(username);
-      }
+      setTypingUsers((prev) => ({ ...prev, [from]: username }));
+      if (selectedUser && from === selectedUser._id) setTypingInfo(username);
     };
 
     const handleStopTyping = ({ from }) => {
-      // Remove from global typing status
       setTypingUsers((prev) => {
         const updated = { ...prev };
         delete updated[from];
         return updated;
       });
-      // Also update current conversation typing if applicable
-      if (selectedUser && from === selectedUser._id) {
-        setTypingInfo(null);
-      }
+      if (selectedUser && from === selectedUser._id) setTypingInfo(null);
     };
 
     const handleMessageSeen = ({ messageId, seenBy, seenAt }) => {
       setMessages((prev) =>
         prev.map((msg) =>
           msg._id === messageId
-            ? {
-                ...msg,
-                seenBy: [...(msg.seenBy || []), { user: seenBy, seenAt }],
-                status: 'read',
-              }
+            ? { ...msg, seenBy: [...(msg.seenBy || []), { user: seenBy, seenAt }], status: 'read' }
             : msg
         )
       );
@@ -195,35 +200,27 @@ export default function Chat() {
       socket.off('userStopTyping', handleStopTyping);
       socket.off('messageSeen', handleMessageSeen);
     };
-  }, [socket, selectedUser, user._id, shouldAutoScroll]);
+  }, [socket, selectedUser, user._id, shouldAutoScroll, privateKey, users]);
 
-  // Handle manual scroll - detect if user is at bottom
   const handleScroll = () => {
     if (!messagesContainerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
-    // If user is within 100px of the bottom, enable auto-scroll
     const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
     setShouldAutoScroll(isAtBottom);
-    // Reset new message counter when user scrolls to bottom
-    if (isAtBottom) {
-      setNewMessageCount(0);
-    }
+    if (isAtBottom) setNewMessageCount(0);
   };
 
-  // Scroll to bottom and reset counter
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     setNewMessageCount(0);
     setShouldAutoScroll(true);
   };
 
-  // Auto-scroll only when at bottom
   useEffect(() => {
     if (!shouldAutoScroll) return;
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typingInfo, shouldAutoScroll]);
 
-  // Reset auto-scroll and message counter when switching conversations
   useEffect(() => {
     setShouldAutoScroll(true);
     setNewMessageCount(0);
@@ -232,49 +229,56 @@ export default function Chat() {
   const handleSelectUser = (u) => {
     setSelectedUser(u);
     setMessages([]);
+    setDecryptedMessages({});
     setTypingInfo(null);
-    // Clear unread count for this user
-    setUnreadCounts((prev) => ({
-      ...prev,
-      [u._id]: 0,
-    }));
+    setUnreadCounts((prev) => ({ ...prev, [u._id]: 0 }));
   };
 
-  // Helper function to get decrypted or plaintext message
+  /**
+   * FIX: getMessageText — safe fallback chain.
+   *
+   * Priority:
+   *   1. Decrypted text from cache (string)
+   *   2. Legacy content.text string (old messages)
+   *   3. Placeholder string
+   *
+   * NEVER returns msg.content (the object) — that was the crash.
+   */
   const getMessageText = (msg) => {
-    // If we have a decrypted message, use it
-    if (decryptedMessages[msg._id]) {
-      return decryptedMessages[msg._id];
+    // 1. Successfully decrypted
+    const cached = decryptedMessages[msg._id];
+    if (typeof cached === 'string' && cached.length > 0) {
+      return cached;
     }
-    // Fallback to plaintext (legacy messages or if decryption fails)
-    if (msg.content?.text) {
+
+    // 2. Decryption was attempted but failed (null in cache) — show placeholder
+    if (msg._id in decryptedMessages && cached === null) {
+      return '[Unable to decrypt]';
+    }
+
+    // 3. Legacy plaintext message (content.text is a string)
+    if (typeof msg.content?.text === 'string' && msg.content.text.length > 0) {
       return msg.content.text;
     }
-    return msg.content || '[Encrypted message]';
+
+    // 4. Final safe fallback — NEVER return msg.content (it's an object → crash)
+    return '[Encrypted message]';
   };
 
-  // Helper function to mark a message as seen
   const markMessageAsSeenLocally = (messageId) => {
     setMessages((prev) =>
       prev.map((msg) =>
         msg._id === messageId && msg.sender._id !== user._id
-          ? {
-              ...msg,
-              seenBy: [...(msg.seenBy || []), { user: user._id, seenAt: new Date() }],
-              status: 'read',
-            }
+          ? { ...msg, seenBy: [...(msg.seenBy || []), { user: user._id, seenAt: new Date() }], status: 'read' }
           : msg
       )
     );
   };
 
-  // Helper function to mark unseen messages from other user as seen
   const markUnseenMessagesAsSeen = (messagesToMark, conversationId) => {
     messagesToMark.forEach((msg) => {
-      // Only mark messages from other user that haven't been seen by current user
       if (msg.sender._id !== user._id && msg.status !== 'read') {
         markMessageAsSeenLocally(msg._id);
-        // Notify sender
         socket?.emit('markMessageSeen', { messageId: msg._id, conversationId });
       }
     });
@@ -287,19 +291,12 @@ export default function Chat() {
     }
 
     try {
-      // Fetch recipient's public key
       const { data: keyData } = await axios.get(`/api/users/${selectedUser._id}/public-key`);
       const recipientPublicKey = keyData.publicKey;
 
-      // Encrypt message
       const { cipherText, nonce } = await encryptMessage(text.trim(), recipientPublicKey, privateKey);
 
-      // Send encrypted message to backend
-      socket.emit('sendMessage', {
-        to: selectedUser._id,
-        cipherText,
-        nonce,
-      });
+      socket.emit('sendMessage', { to: selectedUser._id, cipherText, nonce });
 
       setText('');
       socket.emit('stopTyping', { to: selectedUser._id });
@@ -326,7 +323,7 @@ export default function Chat() {
     }, 1500);
   };
 
-  // Group messages by date for dividers
+  // Group messages by date
   const groupedMessages = [];
   let lastDate = null;
   messages.forEach((msg) => {
@@ -340,93 +337,38 @@ export default function Chat() {
 
   return (
     <div className="chat-layout" onClick={(e) => {
-      if (e.target === e.currentTarget && menuOpen) {
-        setMenuOpen(false);
-      }
+      if (e.target === e.currentTarget && menuOpen) setMenuOpen(false);
     }}>
-      {/* Backdrop Overlay */}
-      {menuOpen && (
-        <div 
-          className="menu-backdrop" 
-          onClick={() => setMenuOpen(false)}
-        ></div>
-      )}
+      {menuOpen && <div className="menu-backdrop" onClick={() => setMenuOpen(false)} />}
 
-      {/* Hamburger Menu for Mobile */}
-      <div className="mobile-menu-toggle">
-        <button 
-          className="hamburger-btn" 
-          onClick={() => setMenuOpen(!menuOpen)}
-          aria-label="Toggle menu"
-        >
-          <span></span>
-          <span></span>
-          <span></span>
-        </button>
-      </div>
-
-      {/* Navigation Sidebar */}
+      {/* Nav Sidebar */}
       <nav className="nav-sidebar">
         <div className="nav-logo">P.</div>
-        
         <div className="nav-menu">
-          <button 
-            className={`nav-btn ${activeNav === 'home' ? 'active' : ''}`}
-            onClick={() => setActiveNav('home')}
-            title="Home"
-          >
-            <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/>
-            </svg>
+          <button className={`nav-btn ${activeNav === 'home' ? 'active' : ''}`} onClick={() => setActiveNav('home')} title="Home">
+            <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
           </button>
-
-          <button 
-            className={`nav-btn ${activeNav === 'messages' ? 'active' : ''}`}
-            onClick={() => setActiveNav('messages')}
-            title="Messages"
-          >
-            <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/>
-            </svg>
+          <button className={`nav-btn ${activeNav === 'messages' ? 'active' : ''}`} onClick={() => setActiveNav('messages')} title="Messages">
+            <svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>
           </button>
-
-          <button 
-            className={`nav-btn ${activeNav === 'settings' ? 'active' : ''}`}
-            onClick={() => setActiveNav('settings')}
-            title="Settings"
-          >
-            <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l1.72-1.34c.15-.12.19-.34.1-.51l-1.63-2.83c-.12-.22-.37-.29-.59-.22l-2.03.81c-.42-.32-.88-.58-1.38-.77L14.4 2.1c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.3 2.34c-.5.19-.95.45-1.38.77l-2.03-.81c-.22-.09-.47 0-.59.22L2.74 7.13c-.1.16-.06.39.1.51l1.72 1.34c-.05.3-.07.62-.07.94s.02.64.07.94l-1.72 1.34c-.15.12-.19.34-.1.51l1.63 2.83c.12.22.37.29.59.22l2.03-.81c.42.32.88.58 1.38.77l.3 2.34c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.3-2.34c.5-.19.96-.45 1.38-.77l2.03.81c.22.09.47 0 .59-.22l1.63-2.83c.1-.16.06-.39-.1-.51l-1.72-1.34zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
-            </svg>
+          <button className={`nav-btn ${activeNav === 'settings' ? 'active' : ''}`} onClick={() => setActiveNav('settings')} title="Settings">
+            <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l1.72-1.34c.15-.12.19-.34.1-.51l-1.63-2.83c-.12-.22-.37-.29-.59-.22l-2.03.81c-.42-.32-.88-.58-1.38-.77L14.4 2.1c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.3 2.34c-.5.19-.95.45-1.38.77l-2.03-.81c-.22-.09-.47 0-.59.22L2.74 7.13c-.1.16-.06.39.1.51l1.72 1.34c-.05.3-.07.62-.07.94s.02.64.07.94l-1.72 1.34c-.15.12-.19.34-.1.51l1.63 2.83c.12.22.37.29.59.22l2.03-.81c.42.32.88.58 1.38.77l.3 2.34c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.3-2.34c.5-.19.96-.45 1.38-.77l2.03.81c.22.09.47 0 .59-.22l1.63-2.83c.1-.16.06-.39-.1-.51l-1.72-1.34zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
           </button>
         </div>
-
-        {/* Account Bar at Bottom */}
         <div className="nav-account">
-          <button 
-            className="account-btn"
-            title={user.username}
-          >
+          <button className="account-btn" title={user.username}>
             <div className="account-avatar">{getInitial(user.username)}</div>
           </button>
           <button className="logout-nav-btn" onClick={logout} title="Logout">
-            <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/>
-            </svg>
+            <svg viewBox="0 0 24 24"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
           </button>
         </div>
       </nav>
 
-      {/* Hamburger Menu for Mobile */}
+      {/* Mobile toggle */}
       <div className="mobile-menu-toggle">
-        <button 
-          className="hamburger-btn" 
-          onClick={() => setMenuOpen(!menuOpen)}
-          aria-label="Toggle menu"
-        >
-          <span></span>
-          <span></span>
-          <span></span>
+        <button className="hamburger-btn" onClick={() => setMenuOpen(!menuOpen)} aria-label="Toggle menu">
+          <span /><span /><span />
         </button>
       </div>
 
@@ -436,7 +378,6 @@ export default function Chat() {
           <div className="sidebar-logo">Pulse<span>.</span></div>
           <button className="logout-btn" onClick={logout}>logout</button>
         </div>
-
         <div className="sidebar-me">
           <div className="user-avatar" style={{ width: 28, height: 28, fontSize: 12 }}>
             {getInitial(user.username)}
@@ -446,9 +387,7 @@ export default function Chat() {
             <div className="sidebar-me-name">{user.username}</div>
           </div>
         </div>
-
         <div className="sidebar-section-label">Users ({users.length})</div>
-
         <div className="user-list">
           {users.map((u) => {
             const isOnline = onlineUsers.includes(u._id);
@@ -458,10 +397,7 @@ export default function Chat() {
               <div
                 key={u._id}
                 className={`user-item ${selectedUser?._id === u._id ? 'active' : ''}`}
-                onClick={() => {
-                  handleSelectUser(u);
-                  setMenuOpen(false);
-                }}
+                onClick={() => { handleSelectUser(u); setMenuOpen(false); }}
               >
                 <div className="user-avatar">
                   {getInitial(u.username)}
@@ -470,16 +406,10 @@ export default function Chat() {
                 <div className="user-info">
                   <div className="user-name">{u.username}</div>
                   <div className={`user-status ${isOnline ? 'online' : ''}`}>
-                    {isTyping ? (
-                      <span className="typing-status">typing...</span>
-                    ) : (
-                      isOnline ? 'online' : 'offline'
-                    )}
+                    {isTyping ? <span className="typing-status">typing...</span> : isOnline ? 'online' : 'offline'}
                   </div>
                 </div>
-                {unreadCount > 0 && (
-                  <div className="unread-badge">{unreadCount}</div>
-                )}
+                {unreadCount > 0 && <div className="unread-badge">{unreadCount}</div>}
               </div>
             );
           })}
@@ -496,7 +426,6 @@ export default function Chat() {
           </div>
         ) : (
           <>
-            {/* Chat Header */}
             <div className="chat-header">
               <div className="user-avatar">
                 {getInitial(selectedUser.username)}
@@ -510,7 +439,6 @@ export default function Chat() {
               </div>
             </div>
 
-            {/* Messages */}
             <div className="messages-area" ref={messagesContainerRef} onScroll={handleScroll}>
               {groupedMessages.map((item, i) =>
                 item.type === 'divider' ? (
@@ -521,11 +449,19 @@ export default function Chat() {
                     className={`message-wrapper ${item.msg.sender._id === user._id ? 'out' : 'in'}`}
                   >
                     <div className="message-bubble">
+                      {/* FIX: getMessageText() always returns a string — never an object */}
                       <div className="message-content">{getMessageText(item.msg)}</div>
                       <div className="message-footer">
                         <span className="message-time">{formatTime(item.msg.createdAt)}</span>
                         {item.msg.sender._id === user._id && (
-                          <svg className={`message-seen ${item.msg.seenBy?.some(s => s.user?._id === selectedUser._id || s.user === selectedUser._id) ? 'seen' : 'unseen'}`} viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                          <svg
+                            className={`message-seen ${
+                              item.msg.seenBy?.some(
+                                (s) => s.user?._id === selectedUser._id || s.user === selectedUser._id
+                              ) ? 'seen' : 'unseen'
+                            }`}
+                            viewBox="0 0 24 24"
+                          >
                             <path d="M1 12l5 5 8-8" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
                             <path d="M9 12l5 5 8-8" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
                           </svg>
@@ -535,25 +471,17 @@ export default function Chat() {
                   </div>
                 )
               )}
-
-              {typingInfo && (
-                <div className="typing-indicator">{typingInfo} is typing...</div>
-              )}
-
+              {typingInfo && <div className="typing-indicator">{typingInfo} is typing...</div>}
               <div ref={messagesEndRef} />
             </div>
 
-            {/* Scroll to bottom button */}
             {newMessageCount > 0 && (
               <button className="scroll-to-bottom-btn" onClick={scrollToBottom}>
-                <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M7 10l5 5 5-5z" />
-                </svg>
+                <svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>
                 <span className="new-message-badge">{newMessageCount}</span>
               </button>
             )}
 
-            {/* Input */}
             <div className="chat-input-area">
               <textarea
                 className="chat-input"
@@ -564,9 +492,7 @@ export default function Chat() {
                 rows={1}
               />
               <button className="send-btn" onClick={handleSend} disabled={!text.trim()}>
-                <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
-                </svg>
+                <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
               </button>
             </div>
           </>

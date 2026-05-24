@@ -1,5 +1,5 @@
 /**
- * Vite + libsodium-wrappers-sumo Test
+ * Vite + libsodium-wrappers Test
  * Run this in browser console after npm run dev starts successfully
  */
 
@@ -21,9 +21,9 @@ try {
 setTimeout(() => {
   console.log('Test 2: Verifying sodium is ready...');
   
-  import('libsodium-wrappers-sumo').then(sodium => {
+  import('libsodium-wrappers').then(sodium => {
     sodium.ready.then(() => {
-      console.log('✅ TEST 2 PASSED: libsodium-wrappers-sumo loaded and ready!');
+      console.log('✅ TEST 2 PASSED: libsodium-wrappers loaded and ready!');
       console.log('   Sodium constants available:');
       console.log('   - crypto_box_PUBLICKEYBYTES:', sodium.crypto_box_PUBLICKEYBYTES);
       console.log('   - crypto_box_SECRETKEYBYTES:', sodium.crypto_box_SECRETKEYBYTES);
