@@ -2,7 +2,7 @@ import { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
 import { ensureSodium, decryptPrivateKey } from '../utils/crypto';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+const API_BASE = import.meta.env.VITE_SERVER_URL || 'http://localhost:5000';
 axios.defaults.baseURL = API_BASE;
 
 const AuthContext = createContext(null);
